@@ -20,6 +20,31 @@ try:
     from tqdm import tqdm
 except Exception:
     tqdm = None
+import multiprocessing as mp
+
+
+def process_group(task):
+    """Worker: write assigned slices from a single candidate file into the shared memmap."""
+    candidate, entries, temp_npy, total, ny, nx, dtype_str = task
+    dtype = np.dtype(dtype_str)
+    mm = np.memmap(temp_npy, dtype=dtype, mode='r+', shape=(total, ny, nx))
+    count = 0
+    with mrcfile.open(candidate, permissive=True) as m:
+        data = m.data
+        for out_idx, img_idx in entries:
+            if data.ndim == 3:
+                if img_idx >= data.shape[0]:
+                    raise IndexError(f"Index {img_idx} out of bounds for file {candidate}")
+                mm[out_idx] = data[img_idx]
+            elif data.ndim == 2:
+                if img_idx != 0:
+                    raise IndexError(f"Index {img_idx} invalid for single-image file {candidate}")
+                mm[out_idx] = data
+            else:
+                raise ValueError(f"Unsupported MRC data dimensions: {data.ndim} in {candidate}")
+            count += 1
+    mm.flush()
+    return count
 
 
 def find_field(names, keywords):
@@ -125,22 +150,10 @@ def main():
         print('ERROR: Could not determine path or idx fields from .cs. Found fields:', names)
         sys.exit(4)
 
-    # Prepare images list
-    images = []
-
-    # Base dir resolution
+    # Prepare references list (candidate path, image index) for all particles
+    refs = []
     base_dir = args.input_dir or os.path.dirname(os.path.abspath(cs_path))
-
-    total = len(arr)
-    if tqdm is not None:
-        index_iter = range(total)
-        index_iter = tqdm(index_iter, desc='Extracting', unit='particles')
-    else:
-        index_iter = range(total)
-
-    for i in index_iter:
-        entry = arr[i]
-        # Depending on type, entry may be structured numpy scalar or dict
+    for i, entry in enumerate(arr):
         if isinstance(entry, np.void):
             raw_path = entry[path_field]
             raw_idx = entry[idx_field]
@@ -148,7 +161,6 @@ def main():
             raw_path = entry[path_field]
             raw_idx = entry[idx_field]
         else:
-            # fallback: could be tuple-like
             try:
                 raw_path = entry[names.index(path_field)]
                 raw_idx = entry[names.index(idx_field)]
@@ -157,14 +169,12 @@ def main():
 
         path_str = decode_field(raw_path)
         path_str = normalize_blob_path(path_str)
-        # Resolve relative or blob-style paths
         if not os.path.isabs(path_str):
             candidate = os.path.join(base_dir, path_str)
         else:
             candidate = path_str
 
         if not os.path.exists(candidate):
-            # try to strip leading slashes or blob prefixes
             candidate_alt = os.path.join(base_dir, os.path.basename(path_str))
             if os.path.exists(candidate_alt):
                 candidate = candidate_alt
@@ -172,33 +182,92 @@ def main():
                 raise FileNotFoundError(f"Referenced MRC/MRCS not found: {candidate}")
 
         img_idx = int(raw_idx)
+        refs.append((candidate, img_idx))
 
-        with mrcfile.open(candidate, permissive=True) as mrc:
-            data = mrc.data
-            if data.ndim == 3:
-                if img_idx >= data.shape[0]:
-                    raise IndexError(f"Index {img_idx} out of bounds for file {candidate}")
-                images.append(data[img_idx].copy())
-            elif data.ndim == 2:
-                if img_idx != 0:
-                    raise IndexError(f"Index {img_idx} invalid for single-image file {candidate}")
-                images.append(data.copy())
-            else:
-                raise ValueError(f"Unsupported MRC data dimensions: {data.ndim} in {candidate}")
+    total = len(refs)
 
-    # Stack and write mrcs
-    stack = np.stack(images, axis=0)
+    # Determine image shape from first referenced image
+    sample_candidate, sample_idx = refs[0]
+    with mrcfile.open(sample_candidate, permissive=True) as m:
+        sample_data = m.data
+        if sample_data.ndim == 3:
+            ny, nx = sample_data.shape[1], sample_data.shape[2]
+        elif sample_data.ndim == 2:
+            ny, nx = sample_data.shape[0], sample_data.shape[1]
+        else:
+            raise ValueError(f"Unsupported MRC data dimensions: {sample_data.ndim} in {sample_candidate}")
+
+    # Pre-allocate memmap-backed array to avoid holding everything in RAM
     out_mrcs = args.output_mrcs
     os.makedirs(os.path.dirname(os.path.abspath(out_mrcs)) or '.', exist_ok=True)
+    temp_npy = out_mrcs + '.npy.tmp'
+    # Use the source dtype for the memmap to avoid per-slice astype conversions.
+    # We'll convert once to float32 when writing the final .mrcs.
+    src_dtype = sample_data.dtype
+    mm = np.memmap(temp_npy, dtype=src_dtype, mode='w+', shape=(total, ny, nx))
+
+    # Group references by candidate file to open each file once
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for out_idx, (candidate, img_idx) in enumerate(refs):
+        groups[candidate].append((out_idx, img_idx))
+
+    # Prepare multiprocessing (per-file) tasks
+    parser_workers = 1
+    try:
+        parser_workers = int(os.environ.get('CS_TO_RELION_WORKERS', '1'))
+    except Exception:
+        parser_workers = 1
+    # allow override from CLI
+    workers = getattr(args, 'workers', None)
+    if workers is None:
+        workers = parser_workers
+
+    tasks = []
+    for candidate, entries in groups.items():
+        tasks.append((candidate, entries, temp_npy, total, ny, nx, str(src_dtype)))
+
+    processed_particles = 0
+    if workers and int(workers) > 1:
+        pool_workers = int(workers)
+        with mp.Pool(pool_workers) as pool:
+            if tqdm is not None:
+                for cnt in tqdm(pool.imap_unordered(process_group, tasks), total=len(tasks), desc='Files', unit='files'):
+                    processed_particles += int(cnt)
+            else:
+                for cnt in pool.imap_unordered(process_group, tasks):
+                    processed_particles += int(cnt)
+    else:
+        # single-process fallback
+        if tqdm is not None:
+            task_iter = tqdm(tasks, desc='Files', unit='files')
+        else:
+            task_iter = tasks
+        for task in task_iter:
+            processed_particles += process_group(task)
+
+    if processed_particles != total:
+        print(f"Warning: processed {processed_particles} particles but expected {total}")
+
+    # Flush memmap to disk
+    mm.flush()
+
+    # Write final mrcs from memmap; convert to float32 once here.
     with mrcfile.new(out_mrcs, overwrite=True) as m:
-        m.set_data(stack.astype(np.float32))
+        m.set_data(np.asarray(mm, dtype=np.float32))
+
+    # remove temp npy
+    try:
+        os.remove(temp_npy)
+    except Exception:
+        pass
 
     # Write minimal star file
     out_star = args.output_star
     os.makedirs(os.path.dirname(os.path.abspath(out_star)) or '.', exist_ok=True)
-    write_star(out_star, os.path.basename(out_mrcs), len(images))
+    write_star(out_star, os.path.basename(out_mrcs), total)
 
-    print(f"Wrote {len(images)} particles to {out_mrcs} and star {out_star}")
+    print(f"Wrote {total} particles to {out_mrcs} and star {out_star}")
 
 
 if __name__ == '__main__':
