@@ -16,6 +16,10 @@ import os
 import sys
 import numpy as np
 import mrcfile
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
 
 def find_field(names, keywords):
@@ -127,7 +131,15 @@ def main():
     # Base dir resolution
     base_dir = args.input_dir or os.path.dirname(os.path.abspath(cs_path))
 
-    for i, entry in enumerate(arr):
+    total = len(arr)
+    if tqdm is not None:
+        index_iter = range(total)
+        index_iter = tqdm(index_iter, desc='Extracting', unit='particles')
+    else:
+        index_iter = range(total)
+
+    for i in index_iter:
+        entry = arr[i]
         # Depending on type, entry may be structured numpy scalar or dict
         if isinstance(entry, np.void):
             raw_path = entry[path_field]
