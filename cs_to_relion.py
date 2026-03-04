@@ -201,10 +201,11 @@ def main():
     out_mrcs = args.output_mrcs
     os.makedirs(os.path.dirname(os.path.abspath(out_mrcs)) or '.', exist_ok=True)
     temp_npy = out_mrcs + '.npy.tmp'
-    # Use the source dtype for the memmap to avoid per-slice astype conversions.
-    # We'll convert once to float32 when writing the final .mrcs.
+    # Use float32 memmap to avoid creating a full in-memory float32 copy later.
+    # Assigning slices will cast to float32 per-slice (small, chunked copies).
     src_dtype = sample_data.dtype
-    mm = np.memmap(temp_npy, dtype=src_dtype, mode='w+', shape=(total, ny, nx))
+    out_dtype = np.float32
+    mm = np.memmap(temp_npy, dtype=out_dtype, mode='w+', shape=(total, ny, nx))
 
     # Group references by candidate file to open each file once
     from collections import defaultdict
@@ -225,7 +226,7 @@ def main():
 
     tasks = []
     for candidate, entries in groups.items():
-        tasks.append((candidate, entries, temp_npy, total, ny, nx, str(src_dtype)))
+        tasks.append((candidate, entries, temp_npy, total, ny, nx, str(out_dtype)))
 
     processed_particles = 0
     if workers and int(workers) > 1:
@@ -252,11 +253,45 @@ def main():
     # Flush memmap to disk
     mm.flush()
 
-    # Write final mrcs from memmap; convert to float32 once here.
-    with mrcfile.new(out_mrcs, overwrite=True) as m:
-        m.set_data(np.asarray(mm, dtype=np.float32))
+    # Write final mrcs using memory-mapped MRC to avoid loading full array into RAM.
+    # mrc_mode=2 corresponds to float32.
+    chunk_size = 1000
+    mrc = mrcfile.new_mmap(out_mrcs, shape=(total, ny, nx), mrc_mode=2, overwrite=True)
 
-    # remove temp npy
+    # Copy data in chunks from temp memmap into the output MRC memmap
+    print(f"Writing {total} particles to {out_mrcs} ...")
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        mrc.data[start:end] = mm[start:end]
+
+    # Compute header stats in chunks to avoid OOM
+    running_sum = np.float64(0)
+    running_sq_sum = np.float64(0)
+    running_min = np.float32(np.inf)
+    running_max = np.float32(-np.inf)
+    n_elements = 0
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        chunk = mrc.data[start:end]
+        running_sum += np.float64(chunk.sum())
+        running_sq_sum += np.float64((chunk.astype(np.float64) ** 2).sum())
+        cmin, cmax = chunk.min(), chunk.max()
+        if cmin < running_min:
+            running_min = cmin
+        if cmax > running_max:
+            running_max = cmax
+        n_elements += chunk.size
+
+    mean_val = running_sum / n_elements
+    rms_val = np.sqrt(max(running_sq_sum / n_elements - mean_val ** 2, 0))
+    mrc.header.dmin = np.float32(running_min)
+    mrc.header.dmax = np.float32(running_max)
+    mrc.header.dmean = np.float32(mean_val)
+    mrc.header.rms = np.float32(rms_val)
+    mrc.flush()
+    mrc.close()
+
+    # Remove temp npy
     try:
         os.remove(temp_npy)
     except Exception:
