@@ -2,6 +2,7 @@ import os
 import argparse
 import logging
 import re
+import time
 import mrcfile
 import numpy as np
 import pandas as pd
@@ -104,6 +105,7 @@ def process_images(df, image_column, input_dir, output_stack_path):
                           mrc_mode=2, overwrite=True) as mrc_out:
         with tqdm(total=n_images, unit="ptcl", desc="Writing stack") as pbar:
             for filepath, entries in file_groups.items():
+                pbar.set_postfix(file=os.path.basename(filepath), refresh=False)
                 # Open each source file as memory-mapped for efficient slice access
                 with mrcfile.mmap(filepath, mode='r', permissive=True) as mrc_in:
                     src = mrc_in.data
@@ -180,11 +182,22 @@ def main():
     logging.info(f"{len(df)} particle rows loaded")
 
     logging.info(f"Input dir: {args.input_dir}")
+    t0 = time.monotonic()
     df = process_images(df, args.image_column, args.input_dir, args.output_stack)
+    elapsed = time.monotonic() - t0
 
     logging.info(f"Saving star file: {args.output_star}")
     save_star_file(df, args.output_star, args.star_file)
 
+    stack_gb = os.path.getsize(args.output_stack) / 1e9
+    print(
+        f"\n--- Summary ---"
+        f"\n  Particles written : {len(df):,}"
+        f"\n  Output stack      : {args.output_stack} ({stack_gb:.2f} GB)"
+        f"\n  Output star file  : {args.output_star}"
+        f"\n  Elapsed           : {elapsed:.1f}s"
+        f"\n  Throughput        : {len(df)/elapsed:,.0f} ptcl/s"
+    )
     logging.info("Done")
 
 
