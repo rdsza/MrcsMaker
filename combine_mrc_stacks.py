@@ -125,7 +125,7 @@ def save_star_file(df, output_path, original_star_path):
             header_lines = lines[:data_start+1]
             break
     
-if data_start is None:
+    if data_start is None:
         raise ValueError("Could not find 'loop_' in original star file")
     
     # Get column headers
