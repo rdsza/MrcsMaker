@@ -12,7 +12,7 @@ def parse_image_reference(ref_string):
     Returns (index, filename)
     """
     if match := re.match(r'(\d+)@(.+)', ref_string):
-        return int(match[1]), match[2]
+        return int(match[1]) - 1, match[2]  # Relion uses 1-based indices
     else:
         raise ValueError(f"Invalid image reference format: {ref_string}")
 
