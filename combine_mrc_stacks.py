@@ -79,7 +79,10 @@ def process_images(df, image_column, input_dir, output_stack_path):
     # Load images
     images = []
     for orig_idx, (img_idx, filename) in image_refs_sorted:
-        filepath = os.path.join(input_dir, filename)
+        if os.path.exists(filename):
+            filepath = filename
+        else:
+            filepath = os.path.join(input_dir, os.path.basename(filename))
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"MRC file not found: {filepath}")
         
