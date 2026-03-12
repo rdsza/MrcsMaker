@@ -67,48 +67,48 @@ def process_images(df, image_column, input_dir, output_stack_path):
     concatenate them, and save as a new stack.
     Returns updated DataFrame with new image references.
     """
-    # Parse image references
-    image_refs = []
-    for ref in df[image_column]:
-        idx, filename = parse_image_reference(ref)
-        image_refs.append((idx, filename))
-    
-    # Sort by original order in star file
-    image_refs_sorted = sorted(enumerate(image_refs), key=lambda x: x[0])
-    
-    # Load images
-    images = []
-    for orig_idx, (img_idx, filename) in image_refs_sorted:
-        if os.path.exists(filename):
-            filepath = filename
-        else:
-            filepath = os.path.join(input_dir, os.path.basename(filename))
+    # Parse all image references up front
+    image_refs = [parse_image_reference(ref) for ref in df[image_column]]
+
+    # Resolve filepaths and group (out_idx, img_idx) by source file to open
+    # each MRC only once instead of once per particle
+    resolved = []
+    file_groups = {}  # filepath -> [(out_idx, img_idx), ...]
+    for out_idx, (img_idx, filename) in enumerate(image_refs):
+        filepath = filename if os.path.exists(filename) else os.path.join(input_dir, os.path.basename(filename))
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"MRC file not found: {filepath}")
-        
-        with mrcfile.open(filepath) as mrc:
-            # Extract the specific image from the stack
-            if mrc.data.ndim == 3:  # It's a stack
-                if img_idx >= mrc.data.shape[0]:
-                    raise IndexError(f"Image index {img_idx} out of bounds for file {filename}")
-                images.append(mrc.data[img_idx].copy())
-            else:  # It's a single image
-                if img_idx != 0:
-                    raise IndexError(f"Image index {img_idx} invalid for single image file {filename}")
-                images.append(mrc.data.copy())
-    
-    # Stack images
-    image_stack = np.stack(images, axis=0)
-    
-    # Save as new MRC stack
-    with mrcfile.new(output_stack_path, overwrite=True) as mrc:
-        mrc.set_data(image_stack.astype(np.float32))
-    
-    # Update image references in DataFrame
+        resolved.append(filepath)
+        file_groups.setdefault(filepath, []).append((out_idx, img_idx))
+
+    n_images = len(image_refs)
+
+    # Determine 2-D image shape from the first file's header only
+    with mrcfile.open(resolved[0], mode='r', permissive=True) as mrc:
+        img_shape = mrc.data.shape[-2:]  # (ny, nx) for both 2-D and stack
+
+    # Pre-allocate memory-mapped output — slices are written directly to disk,
+    # so the full stack is never held in RAM.  mrc_mode 2 = float32.
+    with mrcfile.new_mmap(output_stack_path, shape=(n_images, *img_shape),
+                          mrc_mode=2, overwrite=True) as mrc_out:
+        for filepath, entries in file_groups.items():
+            # Open each source file as memory-mapped for efficient slice access
+            with mrcfile.mmap(filepath, mode='r', permissive=True) as mrc_in:
+                src = mrc_in.data
+                for out_idx, img_idx in entries:
+                    if src.ndim == 3:
+                        if img_idx >= src.shape[0]:
+                            raise IndexError(f"Image index {img_idx} out of bounds in {filepath}")
+                        mrc_out.data[out_idx] = src[img_idx].astype(np.float32)
+                    else:
+                        if img_idx != 0:
+                            raise IndexError(f"Image index {img_idx} invalid for single image {filepath}")
+                        mrc_out.data[out_idx] = src.astype(np.float32)
+
+    # Update image references in DataFrame (1-based indices, as RELION requires)
     output_filename = os.path.basename(output_stack_path)
-    for i in range(len(df)):
-        df.at[i, image_column] = f"{i:06d}@{output_filename}"
-    
+    df[image_column] = [f"{i+1:06d}@{output_filename}" for i in range(n_images)]
+
     return df
 
 
@@ -147,8 +147,8 @@ def save_star_file(df, output_path, original_star_path):
         for header in column_headers:
             f.write(f"{header}\n")
         
-        # Write data
-        for _, row in df.iterrows():
+        # Write data — itertuples is ~100x faster than iterrows for large tables
+        for row in df.itertuples(index=False, name=None):
             f.write(' '.join(str(val) for val in row) + '\n')
 
 
