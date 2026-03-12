@@ -1,9 +1,17 @@
 import os
 import argparse
+import logging
 import re
 import mrcfile
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 
 def parse_image_reference(ref_string):
@@ -82,28 +90,33 @@ def process_images(df, image_column, input_dir, output_stack_path):
         file_groups.setdefault(filepath, []).append((out_idx, img_idx))
 
     n_images = len(image_refs)
+    n_files = len(file_groups)
+    logging.info(f"Found {n_images} particles across {n_files} source file(s)")
 
     # Determine 2-D image shape from the first file's header only
     with mrcfile.open(resolved[0], mode='r', permissive=True) as mrc:
         img_shape = mrc.data.shape[-2:]  # (ny, nx) for both 2-D and stack
+    logging.info(f"Particle shape: {img_shape[0]}x{img_shape[1]} → output {output_stack_path}")
 
     # Pre-allocate memory-mapped output — slices are written directly to disk,
     # so the full stack is never held in RAM.  mrc_mode 2 = float32.
     with mrcfile.new_mmap(output_stack_path, shape=(n_images, *img_shape),
                           mrc_mode=2, overwrite=True) as mrc_out:
-        for filepath, entries in file_groups.items():
-            # Open each source file as memory-mapped for efficient slice access
-            with mrcfile.mmap(filepath, mode='r', permissive=True) as mrc_in:
-                src = mrc_in.data
-                for out_idx, img_idx in entries:
-                    if src.ndim == 3:
-                        if img_idx >= src.shape[0]:
-                            raise IndexError(f"Image index {img_idx} out of bounds in {filepath}")
-                        mrc_out.data[out_idx] = src[img_idx].astype(np.float32)
-                    else:
-                        if img_idx != 0:
-                            raise IndexError(f"Image index {img_idx} invalid for single image {filepath}")
-                        mrc_out.data[out_idx] = src.astype(np.float32)
+        with tqdm(total=n_images, unit="ptcl", desc="Writing stack") as pbar:
+            for filepath, entries in file_groups.items():
+                # Open each source file as memory-mapped for efficient slice access
+                with mrcfile.mmap(filepath, mode='r', permissive=True) as mrc_in:
+                    src = mrc_in.data
+                    for out_idx, img_idx in entries:
+                        if src.ndim == 3:
+                            if img_idx >= src.shape[0]:
+                                raise IndexError(f"Image index {img_idx} out of bounds in {filepath}")
+                            mrc_out.data[out_idx] = src[img_idx].astype(np.float32)
+                        else:
+                            if img_idx != 0:
+                                raise IndexError(f"Image index {img_idx} invalid for single image {filepath}")
+                            mrc_out.data[out_idx] = src.astype(np.float32)
+                        pbar.update()
 
     # Update image references in DataFrame (1-based indices, as RELION requires)
     output_filename = os.path.basename(output_stack_path)
@@ -162,19 +175,17 @@ def main():
     
     args = parser.parse_args()
     
-    # Read star file
-    print(f"Reading star file: {args.star_file}")
+    logging.info(f"Reading star file: {args.star_file}")
     df = read_star_file(args.star_file, args.image_column)
-    
-    # Process images
-    print(f"Processing images from directory: {args.input_dir}")
+    logging.info(f"{len(df)} particle rows loaded")
+
+    logging.info(f"Input dir: {args.input_dir}")
     df = process_images(df, args.image_column, args.input_dir, args.output_stack)
-    
-    # Save updated star file
-    print(f"Saving updated star file: {args.output_star}")
+
+    logging.info(f"Saving star file: {args.output_star}")
     save_star_file(df, args.output_star, args.star_file)
-    
-    print("Done!")
+
+    logging.info("Done")
 
 
 if __name__ == "__main__":
