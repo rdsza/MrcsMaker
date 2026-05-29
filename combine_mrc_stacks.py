@@ -61,7 +61,25 @@ def read_star_file(star_file_path, image_column_name):
     return df
 
 
-def process_images(df, image_column, input_dir, output_stack_path):
+def find_mrc_file(filename, input_dirs, star_file_dir):
+    """
+    Resolve the full path to an MRC file.
+    If input_dirs are provided, each is tried as a base directory.
+    If none are provided (or none contain the file), fall back to
+    using the star file's own directory as the base.
+    """
+    search_bases = list(input_dirs) if input_dirs else [star_file_dir]
+    for base in search_bases:
+        filepath = os.path.join(base, filename)
+        if os.path.exists(filepath):
+            return filepath
+    tried = [os.path.join(b, filename) for b in search_bases]
+    raise FileNotFoundError(
+        f"MRC file not found: {filename}\nSearched in: {tried}"
+    )
+
+
+def process_images(df, image_column, input_dirs, star_file_dir, output_stack_path):
     """
     Process images in the order they appear in the star file,
     concatenate them, and save as a new stack.
@@ -79,7 +97,7 @@ def process_images(df, image_column, input_dir, output_stack_path):
     # Load images
     images = []
     for orig_idx, (img_idx, filename) in image_refs_sorted:
-        filepath = os.path.join(input_dir, filename)
+        filepath = find_mrc_file(filename, input_dirs, star_file_dir)
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"MRC file not found: {filepath}")
         
@@ -125,7 +143,7 @@ def save_star_file(df, output_path, original_star_path):
             header_lines = lines[:data_start+1]
             break
     
-if data_start is None:
+    if data_start is None:
         raise ValueError("Could not find 'loop_' in original star file")
     
     # Get column headers
@@ -152,20 +170,28 @@ if data_start is None:
 def main():
     parser = argparse.ArgumentParser(description='Process Relion star files and combine MRC images.')
     parser.add_argument('--star_file', required=True, help='Input Relion star file')
-    parser.add_argument('--input_dir', required=True, help='Directory containing MRC files')
+    parser.add_argument('--input_dir', nargs='*', default=[],
+                        help='Base director(y/ies) containing MRC files. '
+                             'Can be specified multiple times or as a space-separated list. '
+                             'If omitted, paths are resolved relative to the star file location.')
     parser.add_argument('--output_stack', required=True, help='Output MRC stack file')
     parser.add_argument('--output_star', required=True, help='Output star file')
     parser.add_argument('--image_column', default='rlnImageName', help='Column name for image references')
     
     args = parser.parse_args()
     
+    star_file_dir = os.path.dirname(os.path.abspath(args.star_file))
+    if args.input_dir:
+        print(f"Using input directories: {args.input_dir}")
+    else:
+        print(f"No --input_dir given; resolving paths relative to star file directory: {star_file_dir}")
+    
     # Read star file
     print(f"Reading star file: {args.star_file}")
     df = read_star_file(args.star_file, args.image_column)
     
     # Process images
-    print(f"Processing images from directory: {args.input_dir}")
-    df = process_images(df, args.image_column, args.input_dir, args.output_stack)
+    df = process_images(df, args.image_column, args.input_dir, star_file_dir, args.output_stack)
     
     # Save updated star file
     print(f"Saving updated star file: {args.output_star}")
