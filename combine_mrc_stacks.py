@@ -3,10 +3,16 @@ import argparse
 import logging
 import re
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import mrcfile
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+# Number of slices read/written per vectorised numpy operation.
+# Larger values reduce Python-loop overhead; smaller values limit peak RAM.
+_COPY_CHUNK = 512
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,7 +76,7 @@ def read_star_file(star_file_path, image_column_name):
     return df
 
 
-def process_images(df, image_column, input_dir, output_stack_path):
+def process_images(df, image_column, input_dir, output_stack_path, n_workers=1):
     """
     Process images in the order they appear in the star file,
     concatenate them, and save as a new stack.
@@ -99,26 +105,61 @@ def process_images(df, image_column, input_dir, output_stack_path):
         img_shape = mrc.data.shape[-2:]  # (ny, nx) for both 2-D and stack
     logging.info(f"Particle shape: {img_shape[0]}x{img_shape[1]} → output {output_stack_path}")
 
+    # Sort entries within each file by source index so disk reads are
+    # sequential (reduces seek time on spinning disks / slow NFS).
+    file_items = list(file_groups.items())
+    for _, entries in file_items:
+        entries.sort(key=lambda x: x[1])
+
+    def copy_file(filepath, entries, out_data):
+        """Copy all particles from one source file into the output mmap.
+        Uses chunked numpy fancy indexing to replace the per-particle Python
+        loop, reducing loop overhead ~_COPY_CHUNK× while bounding peak RAM.
+        Each thread works on non-overlapping output indices, so no locking is
+        needed for the array writes.
+        """
+        out_arr = np.array([e[0] for e in entries], dtype=np.intp)
+        src_arr = np.array([e[1] for e in entries], dtype=np.intp)
+        with mrcfile.mmap(filepath, mode='r', permissive=True) as mrc_in:
+            src = mrc_in.data
+            if src.ndim == 3:
+                if src_arr[-1] >= src.shape[0]:  # sorted → last element is max
+                    raise IndexError(f"Image index {src_arr[-1]} out of bounds in {filepath}")
+                for start in range(0, len(entries), _COPY_CHUNK):
+                    sl = slice(start, start + _COPY_CHUNK)
+                    out_data[out_arr[sl]] = src[src_arr[sl]].astype(np.float32)
+            else:
+                if src_arr[0] != 0:
+                    raise IndexError(f"Image index {src_arr[0]} invalid for single image {filepath}")
+                out_data[out_arr[0]] = src.astype(np.float32)
+        return len(entries)
+
+    effective_workers = min(n_workers, n_files)
+
     # Pre-allocate memory-mapped output — slices are written directly to disk,
     # so the full stack is never held in RAM.  mrc_mode 2 = float32.
     with mrcfile.new_mmap(output_stack_path, shape=(n_images, *img_shape),
                           mrc_mode=2, overwrite=True) as mrc_out:
+        out_data = mrc_out.data
         with tqdm(total=n_images, unit="ptcl", desc="Writing stack") as pbar:
-            for filepath, entries in file_groups.items():
-                pbar.set_postfix(file=os.path.basename(filepath), refresh=False)
-                # Open each source file as memory-mapped for efficient slice access
-                with mrcfile.mmap(filepath, mode='r', permissive=True) as mrc_in:
-                    src = mrc_in.data
-                    for out_idx, img_idx in entries:
-                        if src.ndim == 3:
-                            if img_idx >= src.shape[0]:
-                                raise IndexError(f"Image index {img_idx} out of bounds in {filepath}")
-                            mrc_out.data[out_idx] = src[img_idx].astype(np.float32)
-                        else:
-                            if img_idx != 0:
-                                raise IndexError(f"Image index {img_idx} invalid for single image {filepath}")
-                            mrc_out.data[out_idx] = src.astype(np.float32)
-                        pbar.update()
+            if effective_workers <= 1:
+                for filepath, entries in file_items:
+                    pbar.set_postfix(file=os.path.basename(filepath), refresh=False)
+                    pbar.update(copy_file(filepath, entries, out_data))
+            else:
+                # Each future reads a different source file and writes to
+                # non-overlapping output indices, so array writes are safe
+                # without a lock.  The lock only guards tqdm.
+                lock = threading.Lock()
+                with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+                    futures = {
+                        pool.submit(copy_file, fp, entries, out_data): os.path.basename(fp)
+                        for fp, entries in file_items
+                    }
+                    for fut in as_completed(futures):
+                        n = fut.result()  # re-raises any exception from the thread
+                        with lock:
+                            pbar.update(n)
 
     # Update image references in DataFrame (1-based indices, as RELION requires)
     output_filename = os.path.basename(output_stack_path)
@@ -130,41 +171,45 @@ def process_images(df, image_column, input_dir, output_stack_path):
 def save_star_file(df, output_path, original_star_path):
     """
     Save the updated DataFrame as a star file, preserving the original format.
+    Handles RELION 3.1+ files with multiple data blocks (e.g. data_optics +
+    data_particles) by locating the particles loop_ specifically, so the full
+    original header (including any optics block) is preserved verbatim.
     """
-    # Read the original file to get the header
     with open(original_star_path, 'r') as f:
         lines = f.readlines()
-    
-    header_lines = []
-    data_start = None
+
+    # Locate the particles data block and the loop_ that follows it,
+    # mirroring the same logic used in read_star_file.
+    particles_block_found = False
+    loop_start = None
+    data_rows_start = None
+
     for i, line in enumerate(lines):
-        if line.strip() == "loop_":
-            data_start = i
-            header_lines = lines[:data_start+1]
+        stripped = line.strip()
+        if stripped in ("data_particles", "data_"):
+            particles_block_found = True
+        elif stripped == "loop_" and particles_block_found:
+            loop_start = i
+        elif loop_start is not None and stripped and stripped[0] != '_':
+            # First non-header, non-empty line after the column labels
+            data_rows_start = i
             break
-    
-    if data_start is None:
+
+    if loop_start is None:
         raise ValueError("Could not find 'loop_' in original star file")
-    
-    # Get column headers
-    column_headers = []
-    i = data_start + 1
-    while i < len(lines) and lines[i].strip() and lines[i].strip()[0] == '_':
-        column_headers.append(lines[i].strip())
-        i += 1
-    
-    # Write the new star file
+    if data_rows_start is None:
+        raise ValueError("Could not find data rows in original star file")
+
+    # Everything before the data rows (includes optics block, loop_, column
+    # labels for the particles block) is written verbatim.
     with open(output_path, 'w') as f:
-        # Write the header
-        f.writelines(header_lines)
-        
-        # Write column headers
-        for header in column_headers:
-            f.write(f"{header}\n")
-        
-        # Write data — itertuples is ~100x faster than iterrows for large tables
-        for row in df.itertuples(index=False, name=None):
-            f.write(' '.join(str(val) for val in row) + '\n')
+        f.writelines(lines[:data_rows_start])
+
+        # Build all rows as one string and flush in a single syscall
+        f.write('\n'.join(
+            ' '.join(str(val) for val in row)
+            for row in df.itertuples(index=False, name=None)
+        ) + '\n')
 
 
 def main():
@@ -174,7 +219,11 @@ def main():
     parser.add_argument('--output_stack', required=True, help='Output MRC stack file')
     parser.add_argument('--output_star', required=True, help='Output star file')
     parser.add_argument('--image_column', default='rlnImageName', help='Column name for image references')
-    
+    parser.add_argument('--workers', type=int, default=1,
+                        help='Parallel reader threads (default: 1). '
+                             'Increase when particles span many source files '
+                             'and storage supports concurrent reads.')
+
     args = parser.parse_args()
     
     logging.info(f"Reading star file: {args.star_file}")
@@ -183,7 +232,7 @@ def main():
 
     logging.info(f"Input dir: {args.input_dir}")
     t0 = time.monotonic()
-    df = process_images(df, args.image_column, args.input_dir, args.output_stack)
+    df = process_images(df, args.image_column, args.input_dir, args.output_stack, n_workers=args.workers)
     elapsed = time.monotonic() - t0
 
     logging.info(f"Saving star file: {args.output_star}")
